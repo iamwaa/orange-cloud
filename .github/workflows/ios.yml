@@ -1,0 +1,232 @@
+name: iOS
+
+# iOS / watchOS 构建（GitHub Actions）
+#
+#   push / pull_request  →  编译校验：iOS 模拟器 + 免签名，只验证能否编译通过
+#   workflow_dispatch    →  手动构建，可选产出未签名 IPA
+#   release: published   →  产出未签名 IPA 并作为附件挂到该 Release
+#
+# 说明：
+#   * 需要 Xcode 26+（见 CONTRIBUTING.md），runner 固定 macos-26（Apple Silicon）。
+#   * CI 默认注入 OPENSOURCE_UNLOCKED：自编译构建全功能解锁，同时让这条代码路径
+#     持续有编译覆盖（官方 App Store 路径由维护者本地 / Xcode Cloud 覆盖）。
+#   * 仓库未提交 Package.resolved，Sentry 依赖每次按 8.x 最新解析；要可复现构建
+#     请把 Package.resolved 一并提交。
+#   * 产物未签名，必须自行签名后侧载；且仍内置官方 OAuth Client 与 oss.omail.us.kg
+#     回调中转（不向第三方构建开放），长期自用请按 CONTRIBUTING.md 替换
+#     OAuthConfig.swift 的 clientID / redirectURI 并部署自己的回调中转。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/ios/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'apps/ios/**'
+      - '.github/workflows/ios.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      package_ipa:
+        description: 产出未签名 IPA（关闭则只做编译校验）
+        type: boolean
+        default: true
+      opensource_unlocked:
+        description: 注入 OPENSOURCE_UNLOCKED（解锁全部 Pro 功能）
+        type: boolean
+        default: true
+      xcode_major:
+        description: Xcode 主版本（取 runner 上该主版本的最高正式版）
+        type: string
+        default: '26'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  XCODE_PROJECT: 'apps/ios/Orange Cloud/Orange Cloud.xcodeproj'
+  SCHEME: 'Orange Cloud'
+  # 用 github.event.inputs（所有事件下都可用，非手动触发时为空）
+  XCODE_MAJOR: ${{ github.event.inputs.xcode_major || '26' }}
+  # release 与手动勾选时打包 IPA，push / PR 只做编译校验
+  PACKAGE: ${{ github.event_name == 'release' || github.event.inputs.package_ipa == 'true' }}
+  # 手动触发听输入，其余事件默认解锁
+  UNLOCK: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.opensource_unlocked == 'true' }}
+
+jobs:
+  ios:
+    name: iOS 构建
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: write # 仅用于把 IPA 附加到 Release
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+
+      - name: 选择 Xcode
+        run: |
+          set -euo pipefail
+          app="$(ls -d /Applications/Xcode_"$XCODE_MAJOR"*.app 2>/dev/null | grep -vi beta | sort -V | tail -1 || true)"
+          if [ -z "$app" ]; then
+            echo "::warning::runner 上没有 Xcode ${XCODE_MAJOR}.x 正式版，回退到默认 Xcode"
+            app=/Applications/Xcode.app
+          fi
+          sudo xcode-select -s "$app"
+          xcodebuild -version
+
+      - name: 缓存 Swift Package 依赖
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/spm
+          key: spm-${{ runner.os }}-${{ hashFiles('apps/ios/Orange Cloud/Orange Cloud.xcodeproj/project.pbxproj') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: 解析 Swift Package 依赖
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm"
+
+      - name: 编译校验（iOS 模拟器 / 免签名）
+        if: env.PACKAGE != 'true'
+        run: |
+          set -euo pipefail
+          args=(
+            -project "$XCODE_PROJECT"
+            -scheme "$SCHEME"
+            -configuration Debug
+            -destination 'generic/platform=iOS Simulator'
+            -derivedDataPath "$RUNNER_TEMP/dd"
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm"
+            -resultBundlePath "$RUNNER_TEMP/build.xcresult"
+            -skipPackagePluginValidation
+            -skipMacroValidation
+            -quiet
+            CODE_SIGNING_ALLOWED=NO
+          )
+          # 命令行覆盖会顶掉 Debug 配置里的 DEBUG，必须显式补回
+          if [ "$UNLOCK" = "true" ]; then
+            args+=(SWIFT_ACTIVE_COMPILATION_CONDITIONS='DEBUG $(inherited) OPENSOURCE_UNLOCKED')
+          fi
+          xcodebuild build "${args[@]}"
+
+      - name: 读取版本号
+        if: env.PACKAGE == 'true'
+        run: |
+          set -euo pipefail
+          pbx="$XCODE_PROJECT/project.pbxproj"
+          version="$(grep -m1 'MARKETING_VERSION = ' "$pbx" | sed -E 's/.*MARKETING_VERSION = ([^;]+);.*/\1/')"
+          build="$(grep -m1 'CURRENT_PROJECT_VERSION = ' "$pbx" | sed -E 's/[^0-9]*([0-9]+).*/\1/')"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+          echo "APP_BUILD=$build" >> "$GITHUB_ENV"
+          echo "▶ Orange Cloud $version ($build)"
+
+      - name: 归档（iOS 设备 / 未签名）
+        if: env.PACKAGE == 'true'
+        run: |
+          set -euo pipefail
+          # 无签名证书可用：关闭签名与 entitlement 处理，产出未签名 .app。
+          # 注意 entitlements 被清空，重签名时需自行补回 App Group 与 keychain 共享组，
+          # 否则主 App 与小组件 / 文件 / 通知扩展之间无法共享数据。
+          args=(
+            -project "$XCODE_PROJECT"
+            -scheme "$SCHEME"
+            -configuration Release
+            -destination 'generic/platform=iOS'
+            -archivePath "$RUNNER_TEMP/Orange Cloud.xcarchive"
+            -derivedDataPath "$RUNNER_TEMP/dd"
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm"
+            -resultBundlePath "$RUNNER_TEMP/archive.xcresult"
+            -skipPackagePluginValidation
+            -skipMacroValidation
+            -quiet
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_ENTITLEMENTS=""
+            CODE_SIGN_STYLE=Manual
+            PROVISIONING_PROFILE_SPECIFIER=""
+            DEVELOPMENT_TEAM=""
+            ENTITLEMENTS_REQUIRED=NO
+          )
+          if [ "$UNLOCK" = "true" ]; then
+            args+=(SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) OPENSOURCE_UNLOCKED')
+          fi
+          xcodebuild archive "${args[@]}"
+
+      - name: 打包未签名 IPA
+        if: env.PACKAGE == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/Orange Cloud.xcarchive"
+          app="$archive/Products/Applications/Orange Cloud.app"
+          if [ ! -d "$app" ]; then
+            echo "✗ 归档里找不到 Orange Cloud.app"
+            ls -R "$archive/Products" || true
+            exit 1
+          fi
+          out="$RUNNER_TEMP/export"
+          rm -rf "$out"
+          mkdir -p "$out/Payload"
+          cp -R "$app" "$out/Payload/"
+          # 清掉可能残留的签名目录，保证产物完全未签名
+          find "$out/Payload" -name _CodeSignature -type d -prune -exec rm -rf {} +
+          ipa="$out/Orange-Cloud-${APP_VERSION}-${APP_BUILD}-unsigned.ipa"
+          ( cd "$out" && zip -qry "$ipa" Payload )
+          echo "IPA_PATH=$ipa" >> "$GITHUB_ENV"
+          echo "IPA_NAME=$(basename "$ipa")" >> "$GITHUB_ENV"
+          ls -lh "$ipa"
+
+      - name: 上传 IPA 产物
+        if: env.PACKAGE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 附加到 Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "$IPA_PATH" --clobber
+
+      - name: 上传构建诊断（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcresult-${{ github.run_id }}
+          path: ${{ runner.temp }}/*.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 写入运行摘要
+        if: always()
+        run: |
+          {
+            echo "### iOS 构建"
+            echo
+            echo "- Xcode：\`$(xcodebuild -version | head -1)\`"
+            echo "- OPENSOURCE_UNLOCKED：\`$UNLOCK\`"
+            if [ "$PACKAGE" = "true" ]; then
+              echo "- 版本：\`${APP_VERSION:-?} (${APP_BUILD:-?})\`"
+              echo "- 产物：\`${IPA_NAME:-未生成}\`"
+              echo "- ⚠️ IPA **未签名**，需自行签名后侧载；OAuth 需按 CONTRIBUTING.md 自建 Client 与回调中转。"
+            else
+              echo "- 模式：仅编译校验（iOS 模拟器 / 免签名）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
